@@ -23,7 +23,7 @@ main(int argc, char * argv[])
         exit(0);
     }
 
-    str = get_string(match);
+    str = get_scope_string(match->src_str, match->start, match->length);
     printf("match: %s\n", str);
     free(str);
     free_regex(regex);
