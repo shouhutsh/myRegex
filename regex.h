@@ -6,7 +6,7 @@
 #include <string.h>
 #include <setjmp.h>
 
-typedef struct match * (*deal_func)(const void *regex, const char *src_str, size_t offset);
+typedef int (*deal_func)(const void *regex, const char *src_str, size_t offset);
 
 #define MS_NULL -1
 
@@ -18,6 +18,8 @@ struct match{
 
 #define RDT_SIMPLE 0
 #define RDT_SCOPE 1
+#define RDT_ANYKEY 2
+#define RDT_SINGLE 3
 
 #define RDF_NORMAL 0
 #define RDF_NOT 1
@@ -27,6 +29,7 @@ struct data{
     int flag;
     union{
         char *sim_str;
+        char sin_char;
         struct {
             size_t left;
             size_t right;
@@ -36,7 +39,7 @@ struct data{
 
 struct regex{
     deal_func handle;
-    struct regex *next_reg;
+    struct regex *child_reg;
     struct regex *right_reg;
     struct data data;
 };
@@ -50,6 +53,16 @@ Malloc(size_t size){
     void *ptr = malloc(size);
     if(NULL == ptr){
         perror("malloc error");
+        exit(1);
+    }
+    return ptr;
+}
+
+void *
+Calloc(size_t nmemb, size_t size){
+    void *ptr = calloc(nmemb, size);
+    if(NULL == ptr){
+        perror("calloc error");
         exit(1);
     }
     return ptr;
@@ -130,14 +143,15 @@ get_scope_string(const char * src, size_t start, size_t len){
 
 #define start(match) ((match)->start)
 #define length(match) ((match)->length)
-#define src_str(match) ((match)->src_str)
 #define flag(regex) ((regex)->data.flag)
 #define type(regex) ((regex)->data.type)
-#define next_reg(regex) ((regex)->next_reg)
+#define src_str(match) ((match)->src_str)
+#define child_reg(regex) ((regex)->child_reg)
 #define right_reg(regex) ((regex)->right_reg)
 #define sim_str(regex) ((regex)->data.string.sim_str)
+#define sin_char(regex) ((regex)->data.string.sin_char)
 #define handle(regex) ((regex)->handle)
-#define next_reg_handle(regex) (handle(next_reg(regex)))
+#define child_reg_handle(regex) (handle(child_reg(regex)))
 #define right_reg_handle(regex) (handle(right_reg(regex)))
 
 
@@ -145,53 +159,99 @@ get_scope_string(const char * src, size_t start, size_t len){
    handles start
  */
 
-static jmp_buf jmp_match_regex;
 static struct match match;
 
-struct match *
+#define M_ERROR (0)
+#define M_SUCCESS (1)
+#define M_COMPLETE (2)
+#define M_FAIL (3)
+
+int
 DF_BEGIN(const struct regex *cur_reg, const char *string, size_t offset){
     size_t off = offset;
-    struct match *m = next_reg_handle(cur_reg) (next_reg(cur_reg), string, offset);
-    if(NULL == m || off != start(m)){
-        longjmp(jmp_match_regex, 1);
+    int status = child_reg_handle(cur_reg) (child_reg(cur_reg), string, offset);
+    if(M_FAIL == status || off != match.start){
+        return M_ERROR;
     }
-    return m;
+    return M_COMPLETE;
 }
 
-struct match *
+int
 DF_END(const struct regex *cur_reg, const char *string, size_t offset){
     if('\0' == string[offset] || '\n' == string[offset]){
-        return &match;
+        return M_COMPLETE;
     }
-    return NULL;
+    return M_ERROR;
 }
 
-struct match *
+int
+DF_FINISH(const struct regex *cur_reg, const char *string, size_t offset){
+    return M_COMPLETE;
+}
+
+int
 DF_SIMPLE(const struct regex *cur_reg, const char *string, size_t offset){
-    struct match *m;
+    int status;
     size_t len, start = match.start;
     do{
         int first = sunday(string+offset, sim_str(cur_reg));
         if(-1 == first){
-            longjmp(jmp_match_regex, 1);
+            return M_FAIL;
         }
         if(MS_NULL == match.start){
             start = first + offset;
         }else if(0 != first){
-            longjmp(jmp_match_regex, 1);
+            return M_FAIL;
         }
         len = strlen(sim_str(cur_reg));
         offset += first + strlen(sim_str(cur_reg));
-        m = next_reg_handle(cur_reg) (next_reg(cur_reg), string, offset);
-    }while(NULL == m);
+        status = child_reg_handle(cur_reg) (child_reg(cur_reg), string, offset);
+    }while(M_COMPLETE != status);
     match.start = start;
     match.length += len;
-    return &match;
+    return M_COMPLETE;
 }
 
-struct match *
-DF_NULL(const struct regex *cur_reg, const char *string, size_t offset){
-    return &match;
+// TODO
+int
+DF_PLUS(const struct regex *cur_reg, const char *string, size_t offset){
+    return 0;
+}
+
+int
+DF_STAR(const struct regex *cur_reg, const char *string, size_t offset){
+    size_t len;
+    int status;
+    while(1){
+        len = match.length;
+        status = child_reg_handle(cur_reg) (child_reg(cur_reg), string, offset);
+        offset += match.length-len;
+        if(M_FAIL != status && DF_FINISH != right_reg_handle(cur_reg)){
+            status = right_reg_handle(cur_reg) (right_reg(cur_reg), string, offset);
+            if(M_COMPLETE == status){
+                return M_COMPLETE;
+            }
+        }
+        if('\0' == string[offset]){
+            if(DF_FINISH == right_reg_handle(cur_reg)){
+                return M_COMPLETE;
+            }
+            return M_FAIL;
+        }
+    }
+}
+
+int
+DF_SINGLE(const struct regex *cur_reg, const char *string, size_t offset){
+    if((RDT_ANYKEY == type(cur_reg) && '\0' != string[offset])
+        || (RDT_SINGLE == type(cur_reg) && string[offset] == sin_char(cur_reg))){
+        if(MS_NULL == match.start){
+            match.start = offset;
+        }
+        match.length++;
+        return M_SUCCESS;
+    }
+    return M_FAIL;
 }
 
 /**
@@ -208,10 +268,14 @@ static jmp_buf jmp_init_regex;
 void
 free_regex(struct regex *reg){
     if(NULL == reg) return;
-    struct regex * next = next_reg(reg);
+    struct regex * next = child_reg(reg);
     struct regex * right= right_reg(reg);
-    free_regex(next);
-    free_regex(right);
+    if(next != reg && NULL != next){
+        free_regex(next);
+    }
+    if(right != reg && NULL != right){
+        free_regex(right);
+    }
     if(RDT_SIMPLE == type(reg)){
         free(sim_str(reg));
     }
@@ -224,29 +288,43 @@ parse_regex(const char *reg_str, size_t off, struct regex **cur_reg){
     if(NULL == reg_str){
         longjmp(jmp_init_regex, 1);
     }
-    *cur_reg = (struct regex *)Malloc(sizeof(struct regex));
-    bzero(*cur_reg, sizeof(struct regex));
+    *cur_reg = Calloc(1, sizeof(struct regex));
 
     if('\0' == reg_str[off]){
-        handle(*cur_reg) = DF_NULL;
+        handle(*cur_reg) = DF_FINISH;
     }else if(0 == off && '^' == reg_str[0]){
         handle(*cur_reg) = DF_BEGIN;
-        parse_regex(reg_str, 1, &(next_reg(*cur_reg)));
+        parse_regex(reg_str, 1, &(child_reg(*cur_reg)));
     }else if('$' == reg_str[off]){
         if('\0' != reg_str[off+1]){
             longjmp(jmp_init_regex, 1);
         }
         handle(*cur_reg) = DF_END;
-    }else{
+    }else if('.' == reg_str[off]){
+        type(*cur_reg) = RDT_ANYKEY;
+        handle(*cur_reg) = DF_SINGLE;
+        if('+' == reg_str[off+1]){
+            // TODO
+        }else if('*' == reg_str[off+1]){
+            handle(*cur_reg) = DF_STAR;
+            struct regex *temp = Calloc(1, sizeof(struct regex));
+            handle(temp) = DF_SINGLE;
+            type(temp) = RDT_ANYKEY;
+            child_reg(*cur_reg) = temp;
+        }
+        parse_regex(reg_str, off+2, &(right_reg(*cur_reg)));
+    }
+
+    else{
         int i = off;
-        while(not_contain(reg_str[i], "^$") && '\0' != reg_str[i]){
+        while(not_contain(reg_str[i], "^.$") && '\0' != reg_str[i]){
             ++i;
         }
         handle(*cur_reg) = DF_SIMPLE;
         type(*cur_reg) = RDT_SIMPLE;
         flag(*cur_reg) = RDF_NORMAL;
         sim_str(*cur_reg) = get_scope_string(reg_str, off, i-off);
-        parse_regex(reg_str, i, &(next_reg(*cur_reg)));
+        parse_regex(reg_str, i, &(child_reg(*cur_reg)));
     }
 }
 
@@ -266,12 +344,12 @@ init_regex(const char *reg_str){
 struct match *
 match_regex(struct regex *regex, const char *src_str, size_t start){
     if(NULL == regex || NULL == src_str) return NULL;
-    if(0 != setjmp(jmp_match_regex)){
-        return NULL;
-    }
     match.src_str = src_str;
     match.start = MS_NULL;
-    return handle(regex) (regex, src_str, start);
+    if(M_COMPLETE == handle(regex) (regex, src_str, start)){
+        return &match;
+    }
+    return NULL;
 }
 
 /**
