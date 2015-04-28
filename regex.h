@@ -6,7 +6,7 @@
 #include <string.h>
 #include <setjmp.h>
 
-typedef int (*deal_func)(const void *regex, const char *src_str, size_t offset);
+typedef int (*deal_func)(const void *regex, const char *src_str, size_t *offset);
 
 #define MS_NULL -1
 
@@ -151,8 +151,9 @@ get_scope_string(const char * src, size_t start, size_t len){
 #define sim_str(regex) ((regex)->data.string.sim_str)
 #define sin_char(regex) ((regex)->data.string.sin_char)
 #define handle(regex) ((regex)->handle)
-#define child_reg_handle(regex) (handle(child_reg(regex)))
-#define right_reg_handle(regex) (handle(right_reg(regex)))
+#define this_handle(regex, string, offset) (handle(regex) ((regex), (string), (offset)))
+#define child_reg_handle(regex, string, offset) (this_handle((child_reg(regex)), (string), (offset)))
+#define right_reg_handle(regex, string, offset) (this_handle((right_reg(regex)), (string), (offset)))
 
 
 /**
@@ -161,95 +162,105 @@ get_scope_string(const char * src, size_t start, size_t len){
 
 static struct match match;
 
-#define M_ERROR (0)
+#define M_FAIL (0)
 #define M_SUCCESS (1)
 #define M_COMPLETE (2)
-#define M_FAIL (3)
 
 int
-DF_BEGIN(const struct regex *cur_reg, const char *string, size_t offset){
-    size_t off = offset;
-    int status = child_reg_handle(cur_reg) (child_reg(cur_reg), string, offset);
+DF_BEGIN(const struct regex *cur_reg, const char *string, size_t *offset){
+    size_t off = *offset;
+    int status = right_reg_handle(cur_reg, string, offset);
     if(M_FAIL == status || off != match.start){
-        return M_ERROR;
+        return M_FAIL;
     }
     return M_COMPLETE;
 }
 
 int
-DF_END(const struct regex *cur_reg, const char *string, size_t offset){
-    if('\0' == string[offset] || '\n' == string[offset]){
+DF_END(const struct regex *cur_reg, const char *string, size_t *offset){
+    if(0 == string[*offset] || '\n' == string[*offset]){
         return M_COMPLETE;
     }
-    return M_ERROR;
+    return M_FAIL;
 }
 
 int
-DF_FINISH(const struct regex *cur_reg, const char *string, size_t offset){
+DF_FINISH(const struct regex *cur_reg, const char *string, size_t *offset){
     return M_COMPLETE;
 }
 
 int
-DF_SIMPLE(const struct regex *cur_reg, const char *string, size_t offset){
+DF_SIMPLE(const struct regex *cur_reg, const char *string, size_t *offset){
     int status;
+    size_t off = *offset;
     size_t len, start = match.start;
     do{
-        int first = sunday(string+offset, sim_str(cur_reg));
+        int first = sunday(string+off, sim_str(cur_reg));
         if(-1 == first){
             return M_FAIL;
         }
         if(MS_NULL == match.start){
-            start = first + offset;
+            start = first + off;
         }else if(0 != first){
             return M_FAIL;
         }
         len = strlen(sim_str(cur_reg));
-        offset += first + strlen(sim_str(cur_reg));
-        status = child_reg_handle(cur_reg) (child_reg(cur_reg), string, offset);
+        *offset += first + len;
+        status = right_reg_handle(cur_reg, string, offset);
     }while(M_COMPLETE != status);
     match.start = start;
     match.length += len;
     return M_COMPLETE;
 }
 
-// TODO
 int
-DF_PLUS(const struct regex *cur_reg, const char *string, size_t offset){
-    return 0;
-}
-
-int
-DF_STAR(const struct regex *cur_reg, const char *string, size_t offset){
-    size_t len;
+DF_STAR(const struct regex *cur_reg, const char *string, size_t *offset){
     int status;
+    size_t off;
     while(1){
-        len = match.length;
-        status = child_reg_handle(cur_reg) (child_reg(cur_reg), string, offset);
-        offset += match.length-len;
-        if(M_FAIL != status && DF_FINISH != right_reg_handle(cur_reg)){
-            status = right_reg_handle(cur_reg) (right_reg(cur_reg), string, offset);
-            if(M_COMPLETE == status){
+        if(0 == string[*offset]){
+            if(DF_FINISH == handle(right_reg(cur_reg))){
                 return M_COMPLETE;
             }
+            return M_SUCCESS;
         }
-        if('\0' == string[offset]){
-            if(DF_FINISH == right_reg_handle(cur_reg)){
-                return M_COMPLETE;
-            }
-            return M_FAIL;
+        off = *offset;
+        if(DF_FINISH != handle(right_reg(cur_reg))
+            && M_COMPLETE == right_reg_handle(cur_reg, string, offset)){
+            return M_COMPLETE;
+        }
+        *offset = off;
+        if(M_FAIL == child_reg_handle(cur_reg, string, offset)){
+            return M_SUCCESS;
         }
     }
 }
 
 int
-DF_SINGLE(const struct regex *cur_reg, const char *string, size_t offset){
-    if((RDT_ANYKEY == type(cur_reg) && '\0' != string[offset])
-        || (RDT_SINGLE == type(cur_reg) && string[offset] == sin_char(cur_reg))){
+DF_PLUS(const struct regex *cur_reg, const char *string, size_t *offset){
+    int status;
+    size_t off;
+    status = child_reg_handle(cur_reg, string, offset);
+    if(M_SUCCESS == status){
+        return DF_STAR(cur_reg, string, offset);
+    }
+    return M_FAIL;
+}
+
+int
+DF_SINGLE(const struct regex *cur_reg, const char *string, size_t *offset){
+    size_t off = *offset;
+    if(0 != string[off]
+        && (RDT_ANYKEY == type(cur_reg) || string[off] == sin_char(cur_reg))){
         if(MS_NULL == match.start){
-            match.start = offset;
+            match.start = off;
         }
-        match.length++;
-        return M_SUCCESS;
+        ++(*offset);
+        ++(match.length);
+        if(NULL == right_reg(cur_reg)){
+            return M_SUCCESS;
+        }
+        return right_reg_handle(cur_reg, string, offset);
     }
     return M_FAIL;
 }
@@ -262,8 +273,6 @@ DF_SINGLE(const struct regex *cur_reg, const char *string, size_t offset){
 /**
    principal start
  */
-
-static jmp_buf jmp_init_regex;
 
 void
 free_regex(struct regex *reg){
@@ -282,63 +291,64 @@ free_regex(struct regex *reg){
     free(reg);
 }
 
-
-void
-parse_regex(const char *reg_str, size_t off, struct regex **cur_reg){
+struct regex *
+parse_regex(const char *reg_str, size_t *offset, int end){
     if(NULL == reg_str){
-        longjmp(jmp_init_regex, 1);
+        return NULL;
     }
-    *cur_reg = Calloc(1, sizeof(struct regex));
+    int off = *offset;
+    struct regex *cur_reg = Calloc(1, sizeof(struct regex));
 
-    if('\0' == reg_str[off]){
-        handle(*cur_reg) = DF_FINISH;
+    if(0 == reg_str[off]){
+        handle(cur_reg) = DF_FINISH;
     }else if(0 == off && '^' == reg_str[0]){
-        handle(*cur_reg) = DF_BEGIN;
-        parse_regex(reg_str, 1, &(child_reg(*cur_reg)));
+        handle(cur_reg) = DF_BEGIN;
+        ++(*offset);
+        right_reg(cur_reg) = parse_regex(reg_str, offset, 0);
     }else if('$' == reg_str[off]){
-        if('\0' != reg_str[off+1]){
-            longjmp(jmp_init_regex, 1);
+        if(0 != reg_str[off+1]){
+            return NULL;
         }
-        handle(*cur_reg) = DF_END;
+        handle(cur_reg) = DF_END;
     }else if('.' == reg_str[off]){
-        type(*cur_reg) = RDT_ANYKEY;
-        handle(*cur_reg) = DF_SINGLE;
+        type(cur_reg) = RDT_ANYKEY;
+        handle(cur_reg) = DF_SINGLE;
         if('+' == reg_str[off+1]){
-            // TODO
+            ++(*offset);
+            struct regex *parent_reg = Calloc(1, sizeof(struct regex));
+            handle(parent_reg) = DF_PLUS;
+            child_reg(parent_reg) = cur_reg;
+            cur_reg = parent_reg;
         }else if('*' == reg_str[off+1]){
-            handle(*cur_reg) = DF_STAR;
-            struct regex *temp = Calloc(1, sizeof(struct regex));
-            handle(temp) = DF_SINGLE;
-            type(temp) = RDT_ANYKEY;
-            child_reg(*cur_reg) = temp;
+            ++(*offset);
+            struct regex *parent_reg = Calloc(1, sizeof(struct regex));
+            handle(parent_reg) = DF_STAR;
+            child_reg(parent_reg) = cur_reg;
+            cur_reg = parent_reg;
         }
-        parse_regex(reg_str, off+2, &(right_reg(*cur_reg)));
+        ++(*offset);
+        right_reg(cur_reg) = parse_regex(reg_str, offset, 0);
     }
 
     else{
-        int i = off;
-        while(not_contain(reg_str[i], "^.$") && '\0' != reg_str[i]){
-            ++i;
+        while(not_contain(reg_str[off], "^.$") && 0 != reg_str[off]){
+            ++off;
         }
-        handle(*cur_reg) = DF_SIMPLE;
-        type(*cur_reg) = RDT_SIMPLE;
-        flag(*cur_reg) = RDF_NORMAL;
-        sim_str(*cur_reg) = get_scope_string(reg_str, off, i-off);
-        parse_regex(reg_str, i, &(child_reg(*cur_reg)));
+        handle(cur_reg) = DF_SIMPLE;
+        type(cur_reg) = RDT_SIMPLE;
+        flag(cur_reg) = RDF_NORMAL;
+        sim_str(cur_reg) = get_scope_string(reg_str, (*offset), off-(*offset));
+        *offset = off;
+        right_reg(cur_reg) = parse_regex(reg_str, offset, 0);
     }
+    return cur_reg;
 }
 
 struct regex *
 init_regex(const char *reg_str){
-    if(NULL == reg_str || '\0' == reg_str[0]) return NULL;
-
-    struct regex *regex = NULL;
-    if(0 != setjmp(jmp_init_regex)){
-        free_regex(regex);
-        return NULL;
-    }
-    parse_regex(reg_str, 0, &regex);
-    return regex;
+    if(NULL == reg_str || 0 == reg_str[0]) return NULL;
+    size_t off = 0;
+    return parse_regex(reg_str, &off, 0);
 }
 
 struct match *
@@ -346,7 +356,7 @@ match_regex(struct regex *regex, const char *src_str, size_t start){
     if(NULL == regex || NULL == src_str) return NULL;
     match.src_str = src_str;
     match.start = MS_NULL;
-    if(M_COMPLETE == handle(regex) (regex, src_str, start)){
+    if(M_COMPLETE == this_handle(regex, src_str, &start)){
         return &match;
     }
     return NULL;
