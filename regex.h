@@ -127,6 +127,17 @@ int not_contain(char c, const char * str){
     return 1;
 }
 
+size_t char_of_index(const char * string, int ch){
+    if(NULL == string) return -1;
+    size_t i;
+    for(i = 0; 0 != string[i]; ++i){
+        if(ch == string[i]){
+            return i;
+        }
+    }
+    return -1;
+}
+
 char *
 get_scope_string(const char * src, size_t start, size_t len){
     if(NULL == src || 0 == len || (start+len) > strlen(src)){
@@ -143,13 +154,15 @@ get_scope_string(const char * src, size_t start, size_t len){
 
 #define start(match) ((match)->start)
 #define length(match) ((match)->length)
+#define src_str(match) ((match)->src_str)
 #define flag(regex) ((regex)->data.flag)
 #define type(regex) ((regex)->data.type)
-#define src_str(match) ((match)->src_str)
 #define child_reg(regex) ((regex)->child_reg)
 #define right_reg(regex) ((regex)->right_reg)
 #define sim_str(regex) ((regex)->data.string.sim_str)
 #define sin_char(regex) ((regex)->data.string.sin_char)
+#define left(regex) ((regex)->data.string.scope.left)
+#define right(regex) ((regex)->data.string.scope.right)
 #define handle(regex) ((regex)->handle)
 #define this_handle(regex, string, offset) (handle(regex) ((regex), (string), (offset)))
 #define child_reg_handle(regex, string, offset) (this_handle((child_reg(regex)), (string), (offset)))
@@ -190,6 +203,24 @@ DF_FINISH(const struct regex *cur_reg, const char *string, size_t *offset){
 }
 
 int
+DF_SINGLE(const struct regex *cur_reg, const char *string, size_t *offset){
+    size_t off = *offset;
+    if(0 != string[off]
+        && (RDT_ANYKEY == type(cur_reg) || string[off] == sin_char(cur_reg))){
+        if(MS_NULL == match.start){
+            match.start = off;
+        }
+        ++(*offset);
+        ++(match.length);
+        if(NULL == right_reg(cur_reg)){
+            return M_SUCCESS;
+        }
+        return right_reg_handle(cur_reg, string, offset);
+    }
+    return M_FAIL;
+}
+
+int
 DF_SIMPLE(const struct regex *cur_reg, const char *string, size_t *offset){
     int status;
     size_t off = *offset;
@@ -206,6 +237,9 @@ DF_SIMPLE(const struct regex *cur_reg, const char *string, size_t *offset){
         }
         len = strlen(sim_str(cur_reg));
         *offset += first + len;
+        if(NULL == right_reg(cur_reg)){
+            break;
+        }
         status = right_reg_handle(cur_reg, string, offset);
     }while(M_COMPLETE != status);
     match.start = start;
@@ -248,21 +282,24 @@ DF_PLUS(const struct regex *cur_reg, const char *string, size_t *offset){
 }
 
 int
-DF_SINGLE(const struct regex *cur_reg, const char *string, size_t *offset){
-    size_t off = *offset;
-    if(0 != string[off]
-        && (RDT_ANYKEY == type(cur_reg) || string[off] == sin_char(cur_reg))){
-        if(MS_NULL == match.start){
-            match.start = off;
-        }
-        ++(*offset);
-        ++(match.length);
-        if(NULL == right_reg(cur_reg)){
-            return M_SUCCESS;
-        }
-        return right_reg_handle(cur_reg, string, offset);
+DF_ONCE(const struct regex *cur_reg, const char *string, size_t *offset){
+    if(M_FAIL == child_reg_handle(cur_reg, string, offset)){
+        return M_FAIL;
     }
-    return M_FAIL;
+    return right_reg_handle(cur_reg, string, offset);
+}
+
+int
+DF_OR(const struct regex *cur_reg, const char *string, size_t *offset){
+    size_t off = *offset;
+    if(M_FAIL == child_reg_handle(cur_reg, string, &off)){
+        if(NULL == right_reg(cur_reg)) return M_FAIL;
+        if(M_FAIL == right_reg_handle(cur_reg, string, &off)){
+            return M_FAIL;
+        }
+    }
+    *offset = off;
+    return M_SUCCESS;
 }
 
 /**
@@ -292,6 +329,105 @@ free_regex(struct regex *reg){
 }
 
 struct regex *
+do_star_or_plus(const char *string, size_t *offset){
+    size_t off = *offset;
+    struct regex *parent_reg = Calloc(1, sizeof(struct regex));
+    if('+' == string[off]){
+        ++(*offset);
+        handle(parent_reg) = DF_PLUS;
+    }else if('*' == string[off]){
+        ++(*offset);
+        handle(parent_reg) = DF_STAR;
+    }else{
+        handle(parent_reg) = DF_ONCE;
+    }
+    return parent_reg;
+}
+
+struct regex *
+do_parentheses(const char *string, size_t *offset){
+    if('|' == string[*offset]) return NULL;
+    int i, end, len, off = *offset;
+    struct regex *regex = NULL, *cur_reg = NULL, *temp = NULL;
+    len = char_of_index(string, ')');
+    end = off + len;
+    for(i = off; i < end; ++i){
+        if('|' == string[i]){
+            temp = Calloc(1, sizeof(struct regex));
+            handle(temp) = DF_SIMPLE;
+            type(temp) = RDT_SIMPLE;
+            sim_str(temp) = get_scope_string(string, off, i-off);
+            off = i+1;
+            if(NULL == regex){
+                regex = Calloc(1, sizeof(struct regex));
+                handle(regex) = DF_OR;
+                child_reg(regex) = temp;
+                cur_reg = regex;
+            }else{
+                right_reg(cur_reg) = Calloc(1, sizeof(struct regex));
+                cur_reg = right_reg(cur_reg);
+                handle(cur_reg) = DF_OR;
+                child_reg(cur_reg) = temp;
+            }
+        }
+    }
+    if(NULL == regex){
+        regex = Calloc(1, sizeof(struct regex));
+        handle(regex) = DF_SIMPLE;
+        type(regex) = RDT_SIMPLE;
+        sim_str(regex) = get_scope_string(string, *offset, len);
+    }else{
+        temp = Calloc(1, sizeof(struct regex));
+        handle(temp) = DF_SIMPLE;
+        type(temp) = RDT_SIMPLE;
+        sim_str(temp) = get_scope_string(string, off, len-off);
+        right_reg(cur_reg) = temp;
+    }
+    *offset += len;
+    return regex;
+}
+
+struct regex *
+do_bracket(const char *string, size_t *offset){
+    /*
+    struct regex *cur_reg = *regex;
+    int flag = RDF_NORMAL, off = *offset, len;
+    if('^' == string[*offset]){
+        ++(*offset);
+        flag = RDF_NOT;
+    }
+    if((len = sunday(string+off, ']')) <= 0){
+        return -1;
+    }
+    int i = off, end = len+off;
+    for(; i < end; ++i){
+        if('-' == string[i]){
+            if(off < i && i < end){
+                if(off+1 != i){
+                    handle(cur_reg) = DF_SIMPLE;
+                    type(cur_reg) = RDT_SIMPLE;
+                    sim_str(cur_reg) = get_scope_string(string, off, i-1);
+                    off = i-1;
+                }
+                struct regex *temp = Calloc(1, sizeof(struct regex));
+                handle(temp) = DF_SIMPLE;
+                type(temp) = RDT_SCOPE;
+                left(temp) = string[i-1];
+                right(temp) = string[i+1];
+                right_reg(cur_reg) = temp;
+                cur_reg = temp;
+                off = i+1;
+            }else{
+                return -1;
+            }
+        }
+    }
+    *offset = end+1;
+    */
+    return NULL;
+}
+
+struct regex *
 parse_regex(const char *reg_str, size_t *offset, int end){
     if(NULL == reg_str){
         return NULL;
@@ -311,23 +447,23 @@ parse_regex(const char *reg_str, size_t *offset, int end){
         }
         handle(cur_reg) = DF_END;
     }else if('.' == reg_str[off]){
+        ++(*offset);
         type(cur_reg) = RDT_ANYKEY;
         handle(cur_reg) = DF_SINGLE;
-        if('+' == reg_str[off+1]){
-            ++(*offset);
-            struct regex *parent_reg = Calloc(1, sizeof(struct regex));
-            handle(parent_reg) = DF_PLUS;
-            child_reg(parent_reg) = cur_reg;
-            cur_reg = parent_reg;
-        }else if('*' == reg_str[off+1]){
-            ++(*offset);
-            struct regex *parent_reg = Calloc(1, sizeof(struct regex));
-            handle(parent_reg) = DF_STAR;
-            child_reg(parent_reg) = cur_reg;
-            cur_reg = parent_reg;
-        }
-        ++(*offset);
+        struct regex *parent_reg = do_star_or_plus(reg_str, offset);
+        child_reg(parent_reg) = cur_reg;
+        cur_reg = parent_reg;
         right_reg(cur_reg) = parse_regex(reg_str, offset, 0);
+    }else if('(' == reg_str[off]){
+        ++(*offset);
+        cur_reg = do_parentheses(reg_str, offset);
+        struct regex *parent_reg = do_star_or_plus(reg_str, offset);
+        child_reg(parent_reg) = cur_reg;
+        cur_reg = parent_reg;
+        right_reg(cur_reg) = parse_regex(reg_str, offset, 0);
+    }else if('[' == reg_str[off]){
+        ++(*offset);
+        cur_reg = do_bracket(reg_str, offset);
     }
 
     else{
@@ -336,7 +472,6 @@ parse_regex(const char *reg_str, size_t *offset, int end){
         }
         handle(cur_reg) = DF_SIMPLE;
         type(cur_reg) = RDT_SIMPLE;
-        flag(cur_reg) = RDF_NORMAL;
         sim_str(cur_reg) = get_scope_string(reg_str, (*offset), off-(*offset));
         *offset = off;
         right_reg(cur_reg) = parse_regex(reg_str, offset, 0);
@@ -356,7 +491,8 @@ match_regex(struct regex *regex, const char *src_str, size_t start){
     if(NULL == regex || NULL == src_str) return NULL;
     match.src_str = src_str;
     match.start = MS_NULL;
-    if(M_COMPLETE == this_handle(regex, src_str, &start)){
+    int stat = this_handle(regex, src_str, &start);
+    if(M_COMPLETE == stat || M_SUCCESS == stat){
         return &match;
     }
     return NULL;
