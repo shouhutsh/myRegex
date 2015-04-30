@@ -1,10 +1,13 @@
 CC=gcc
 CFLAGS= -g -Wall
 
-all: regex
+all: test
 
-regex: regex.c
+test: regex.o tools.o test.c
 	$(CC) -o $@ $^ $(CFLAGS)
 
+%.o: %.c
+	$(CC) -o $@ -c $^ $(FLAGS)
+
 clean:
-	rm -rf regex
+	rm -rf test *.o
