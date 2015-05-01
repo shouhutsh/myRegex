@@ -4,10 +4,10 @@ CFLAGS= -g -Wall
 all: test
 
 test: regex.o tools.o test.c
-	$(CC) -o $@ $^ $(CFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^
 
 %.o: %.c
-	$(CC) -o $@ -c $^ $(FLAGS)
+	$(CC) $(CFLAGS) -c -o $@ $^
 
 clean:
 	rm -rf test *.o
